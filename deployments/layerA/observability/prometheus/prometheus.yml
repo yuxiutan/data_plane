@@ -1,0 +1,52 @@
+# Layer A — Prometheus scrape config
+# Scrapes: cAdvisor, node-exporter, Logstash, Redpanda, EMQX
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    metrics_path: /metrics
+
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # Logstash: no native Prometheus endpoint (9600 is JSON). Use cAdvisor for container CPU/mem.
+  # TODO: add logstash-exporter or custom sidecar to expose pipeline events in/out.
+
+  - job_name: redpanda
+    static_configs:
+      - targets: ["redpanda:9644"]
+    metrics_path: /public_metrics
+    scrape_interval: 15s
+
+  # EMQX: Pull mode via REST API (stats, auth, data_integration)
+  - job_name: emqx_stats
+    static_configs:
+      - targets: ["wangfalcon.tplinkdns.com:18083"]
+    metrics_path: /api/v5/prometheus/stats
+    scheme: http
+    scrape_interval: 15s
+    # basic_auth left empty; enable in EMQX Dashboard if needed
+
+  - job_name: emqx_auth
+    static_configs:
+      - targets: ["wangfalcon.tplinkdns.com:18083"]
+    metrics_path: /api/v5/prometheus/auth
+    scheme: http
+    scrape_interval: 15s
+
+  - job_name: emqx_data_integration
+    static_configs:
+      - targets: ["wangfalcon.tplinkdns.com:18083"]
+    metrics_path: /api/v5/prometheus/data_integration
+    scheme: http
+    scrape_interval: 15s
