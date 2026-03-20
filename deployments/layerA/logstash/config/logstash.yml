@@ -1,0 +1,25 @@
+# Logstash main config for Layer A
+# See: https://www.elastic.co/guide/en/logstash/current/logstash-settings-file.html
+
+http.host: "0.0.0.0"
+path.config: /usr/share/logstash/pipeline
+path.data: /usr/share/logstash/data
+path.logs: /usr/share/logstash/logs
+path.plugins: /usr/share/logstash/plugins
+
+# Monitoring API (for Prometheus / health)
+api.enabled: true
+api.http.host: "0.0.0.0"
+api.http.port: 9600
+
+log.level: info
+log.format: plain
+pipeline.workers: 2
+pipeline.batch.size: 125
+pipeline.batch.delay: 50
+
+queue.type: persisted
+path.queue: /usr/share/logstash/queue
+queue.max_bytes: 1gb
+queue.checkpoint.writes: 1024
+queue.drain: false

@@ -1,0 +1,15 @@
+- pipeline.id: syslog-to-kafka
+  path.config: "/usr/share/logstash/pipeline/10-syslog-to-kafka.conf"
+  pipeline.workers: 1
+
+- pipeline.id: http-to-kafka
+  path.config: "/usr/share/logstash/pipeline/20-http-to-kafka.conf"
+  pipeline.workers: 1
+
+- pipeline.id: kafka-to-postgres
+  path.config: "/usr/share/logstash/pipeline/30-kafka-to-postgres.conf"
+  pipeline.workers: 1
+
+- pipeline.id: mqtt_wazuh
+  path.config: "/usr/share/logstash/pipeline/mqtt_wazuh.conf"
+  pipeline.workers: 2
