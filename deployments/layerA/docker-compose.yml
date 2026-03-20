@@ -1,0 +1,381 @@
+# Layer A — Data Plane / Ingestion Plane
+# Core: EMQX, Redpanda, Logstash, Postgres
+# Observability: Prometheus, Grafana, cAdvisor, Node Exporter
+# Optional profile: edgex — EdgeX Foundry publishing to EMQX
+#
+# Run:  docker compose up -d
+# EdgeX: docker compose --profile edgex up -d
+
+version: "3.8"
+# name: layerA
+
+services:
+  # --- Core: Kafka-compatible broker ---
+  redpanda:
+    image: redpandadata/redpanda:v24.3.5
+    container_name: layera-redpanda
+    hostname: redpanda
+    command: redpanda start --smp 1 --memory 1G --reserve-memory 0M --overprovisioned --node-id 0 --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092 --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092 --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082 --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082 --rpc-addr 0.0.0.0:33145
+    ports:
+      - "19092:19092" # Kafka external
+      - "18082:18082" # Schema Registry / REST
+      - "9645:9644"   # Admin API + Prometheus metrics (Host port changed to 9645)
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - layera
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    restart: unless-stopped
+
+  redpanda-console:
+    image: redpandadata/console:v2.4.3
+    container_name: layera-redpanda-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8089:8080"
+    networks:
+      - layera
+    restart: unless-stopped
+
+  # --- Core: Postgres (normalized events store) ---
+  postgres:
+    image: postgres:16-alpine
+    container_name: layera-postgres
+    hostname: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-layera}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-layera}
+      POSTGRES_DB: ${POSTGRES_DB:-layera}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - layera
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-layera} -d ${POSTGRES_DB:-layera}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # --- Core: Logstash (intake syslog+http → Kafka → Postgres) ---
+  logstash:
+    build:
+      context: ./logstash
+      dockerfile: Dockerfile
+    image: layera-logstash:local
+    container_name: layera-logstash
+    hostname: logstash
+    environment:
+      LS_JAVA_OPTS: "-Xms1g -Xmx1g"
+      HTTP_HOST: "0.0.0.0"
+      XPACK_MONITORING_ENABLED: "false"
+    ports:
+      - "5140:5140/udp"  # Syslog UDP
+      - "8088:8088/tcp"  # HTTP intake
+      - "9600:9600"      # Monitoring API
+    volumes:
+      - ./logstash/config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./wazuh_buffer:/usr/share/logstash/wazuh_buffer
+      - ./certs:/usr/share/logstash/certs:ro
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - layera
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9600/_node/stats/pipelines?pretty | head -1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  # --- Observability ---
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: layera-prometheus
+    hostname: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - layera
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: layera-grafana
+    hostname: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_HTTP_PORT: 3000
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - layera
+    restart: unless-stopped
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: layera-cadvisor
+    hostname: cadvisor
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "8081:8080"
+    networks:
+      - layera
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: layera-node-exporter
+    hostname: node-exporter
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+    volumes:
+      - /:/host:ro,rslave
+    ports:
+      - "9100:9100"
+    networks:
+      - layera
+    restart: unless-stopped
+
+  # ========== Optional profile: edgex ==========
+  # Start with: docker compose --profile edgex up -d
+  # EdgeX uses Layer A's EMQX for message bus and MQTT export.
+
+  edgex-database:
+    profiles:
+      - edgex
+    image: postgres:16-alpine
+    container_name: layera-edgex-postgres
+    hostname: edgex-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: edgex
+    ports:
+      - "5433:5432"
+    volumes:
+      - edgex-db-data:/var/lib/postgresql/data
+    networks:
+      - layera
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d edgex"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  edgex-core-keeper:
+    profiles:
+      - edgex
+    image: nexus3.edgexfoundry.org:10004/core-keeper:latest
+    container_name: layera-edgex-keeper
+    hostname: edgex-core-keeper
+    depends_on:
+      edgex-database:
+        condition: service_healthy
+    environment:
+      EDGEX_SECURITY_SECRET_STORE: "false"
+      DATABASE_HOST: edgex-postgres
+      MESSAGEBUS_TYPE: mqtt
+      MESSAGEBUS_PROTOCOL: tcp
+      MESSAGEBUS_HOST: emqx
+      MESSAGEBUS_PORT: "1883"
+      MESSAGEBUS_AUTHMODE: none
+      SERVICE_HOST: edgex-core-keeper
+    ports:
+      - "59890:59890"
+    networks:
+      - layera
+    restart: unless-stopped
+
+  edgex-core-common-config-bootstrapper:
+    profiles:
+      - edgex
+    image: nexus3.edgexfoundry.org:10004/core-common-config-bootstrapper:latest
+    container_name: layera-edgex-config-bootstrapper
+    hostname: edgex-core-common-config-bootstrapper
+    depends_on:
+      edgex-core-keeper:
+        condition: service_started
+    environment:
+      EDGEX_SECURITY_SECRET_STORE: "false"
+      ALL_SERVICES_REGISTRY_HOST: edgex-core-keeper
+      ALL_SERVICES_MESSAGEBUS_HOST: emqx
+      ALL_SERVICES_DATABASE_HOST: edgex-postgres
+      APP_SERVICES_CLIENTS_CORE_METADATA_HOST: edgex-core-metadata
+      DEVICE_SERVICES_CLIENTS_CORE_METADATA_HOST: edgex-core-metadata
+    command: ["/core-common-config-bootstrapper", "--registry", "-cp=keeper.http://edgex-core-keeper:59890"]
+    networks:
+      - layera
+    restart: "no"
+
+  edgex-core-metadata:
+    profiles:
+      - edgex
+    image: nexus3.edgexfoundry.org:10004/core-metadata:latest
+    container_name: layera-edgex-metadata
+    hostname: edgex-core-metadata
+    depends_on:
+      edgex-core-keeper:
+        condition: service_started
+      edgex-database:
+        condition: service_healthy
+      edgex-core-common-config-bootstrapper:
+        condition: service_completed_successfully
+    environment:
+      EDGEX_SECURITY_SECRET_STORE: "false"
+      SERVICE_HOST: edgex-core-metadata
+    command: ["--registry", "-cp=keeper.http://edgex-core-keeper:59890"]
+    ports:
+      - "59881:59881"
+    networks:
+      - layera
+    restart: unless-stopped
+
+  edgex-core-data:
+    profiles:
+      - edgex
+    image: nexus3.edgexfoundry.org:10004/core-data:latest
+    container_name: layera-edgex-data
+    hostname: edgex-core-data
+    depends_on:
+      edgex-core-metadata:
+        condition: service_started
+      edgex-database:
+        condition: service_healthy
+      edgex-core-common-config-bootstrapper:
+        condition: service_completed_successfully
+    environment:
+      EDGEX_SECURITY_SECRET_STORE: "false"
+      SERVICE_HOST: edgex-core-data
+    command: ["--registry", "-cp=keeper.http://edgex-core-keeper:59890"]
+    ports:
+      - "59880:59880"
+    networks:
+      - layera
+    restart: unless-stopped
+
+  edgex-core-command:
+    profiles:
+      - edgex
+    image: nexus3.edgexfoundry.org:10004/core-command:latest
+    container_name: layera-edgex-command
+    hostname: edgex-core-command
+    depends_on:
+      edgex-core-metadata:
+        condition: service_started
+      edgex-core-data:
+        condition: service_started
+      edgex-database:
+        condition: service_healthy
+      edgex-core-common-config-bootstrapper:
+        condition: service_completed_successfully
+    environment:
+      EDGEX_SECURITY_SECRET_STORE: "false"
+      SERVICE_HOST: edgex-core-command
+      EXTERNALMQTT_URL: tcp://emqx:1883
+    command: ["--registry", "-cp=keeper.http://edgex-core-keeper:59890"]
+    ports:
+      - "59882:59882"
+    networks:
+      - layera
+    restart: unless-stopped
+
+  edgex-app-service-configurable:
+    profiles:
+      - edgex
+    image: nexus3.edgexfoundry.org:10004/app-service-configurable:latest
+    container_name: layera-edgex-app-mqtt
+    hostname: edgex-app-service-configurable
+    depends_on:
+      edgex-core-data:
+        condition: service_started
+      edgex-core-common-config-bootstrapper:
+        condition: service_completed_successfully
+    environment:
+      EDGEX_SECURITY_SECRET_STORE: "false"
+      EDGEX_PROFILE: mqtt-export
+      SERVICE_HOST: edgex-app-service-configurable
+      MESSAGEBUS_TRIGGER: edgex-messagebus
+      BINDING_MQTTEXPORT_PARAMETERS_BROKERADDRESS: tcp://emqx:1883
+      BINDING_MQTTEXPORT_PARAMETERS_TOPIC: edgex/events
+    command: ["--registry", "-cp=keeper.http://edgex-core-keeper:59890"]
+    ports:
+      - "59700:59700"
+    networks:
+      - layera
+    restart: unless-stopped
+
+  edgex-device-virtual:
+    profiles:
+      - edgex
+    image: nexus3.edgexfoundry.org:10004/device-virtual:latest
+    container_name: layera-edgex-device-virtual
+    hostname: edgex-device-virtual
+    depends_on:
+      edgex-core-metadata:
+        condition: service_started
+      edgex-core-data:
+        condition: service_started
+      edgex-core-common-config-bootstrapper:
+        condition: service_completed_successfully
+    environment:
+      EDGEX_SECURITY_SECRET_STORE: "false"
+      SERVICE_HOST: edgex-device-virtual
+    command: ["-cp=keeper.http://edgex-core-keeper:59890", "--registry"]
+    ports:
+      - "59900:59900"
+    networks:
+      - layera
+    restart: unless-stopped
+
+networks:
+  layera:
+    name: layera_net
+    driver: bridge
+
+volumes:
+  redpanda-data:
+  postgres-data:
+  prometheus-data:
+  grafana-data:
+  edgex-db-data:
